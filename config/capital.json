@@ -1,0 +1,7 @@
+{
+  "total_capital": 150000,
+  "paper_starting_cash": 150000,
+  "currency": "INR",
+  "shared": true,
+  "note": "Single paper cash pool shared by Nifty + Stocks desks. Open positions in either desk reduce free cash for both."
+}

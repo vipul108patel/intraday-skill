@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en" class="theme-dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Intraday Desk</title>
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("nifty-desk-theme") || "dark";
+        document.documentElement.classList.remove("theme-dark", "theme-light");
+        document.documentElement.classList.add(t === "light" ? "theme-light" : "theme-dark");
+      } catch (e) {
+        document.documentElement.classList.add("theme-dark");
+      }
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css?v=20261111f" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+  <header class="bar">
+    <div class="brand">
+      <span class="mark">N</span>
+      <div>
+        <strong>Intraday Desk</strong>
+        <small id="brandSub">Loading strategy…</small>
+      </div>
+    </div>
+    <nav class="desk-nav" id="deskNav" aria-label="Desks">
+      <button type="button" class="desk-btn on" data-desk="overview">Overview</button>
+      <button type="button" class="desk-btn" data-desk="nifty">Nifty</button>
+      <button type="button" class="desk-btn" data-desk="stocks">Stocks</button>
+    </nav>
+    <div class="chips">
+      <span id="pillTime" class="chip">IST —</span>
+      <span id="pillLtp" class="chip green">NIFTY —</span>
+      <span id="pillMode" class="chip amber">PAPER</span>
+      <span id="pillAngel" class="chip">Angel —</span>
+      <span id="pillLot" class="chip">Lot 65</span>
+      <span id="pillStrategy" class="chip teal">—</span>
+    </div>
+    <div class="bar-actions">
+      <div class="seg" id="periodGroup" title="Filter by market session date (IST)">
+        <button type="button" class="period" data-period="day">Day</button>
+        <button type="button" class="period" data-period="week">Week</button>
+        <button type="button" class="period" data-period="month">Month</button>
+        <button type="button" class="period on" data-period="all">All</button>
+      </div>
+      <label class="days-field" title="Backtest lookback days">
+        <span>Days</span>
+        <input id="btDays" type="number" min="5" max="120" value="30" />
+      </label>
+      <div class="seg theme-seg" id="themeSeg" title="Theme">
+        <button type="button" class="theme-btn" data-theme="light">Light</button>
+        <button type="button" class="theme-btn on" data-theme="dark">Dark</button>
+      </div>
+      <button type="button" id="btnBacktest" class="btn primary">
+        <span class="btn-label">Backtest</span>
+        <span class="btn-spin" hidden></span>
+      </button>
+      <button type="button" id="btnPaper" class="btn">Paper tick</button>
+      <button type="button" id="btnRefresh" class="btn ghost" aria-label="Refresh">↻</button>
+      <button type="button" id="btnReset" class="btn ghost danger">Reset</button>
+    </div>
+  </header>
+
+  <div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
+
+  <div class="modal-backdrop" id="resetModal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="resetModalTitle">
+      <header class="modal-head">
+        <div>
+          <p class="modal-eyebrow">Reset data</p>
+          <h2 id="resetModalTitle">What should we clear?</h2>
+        </div>
+        <button type="button" class="modal-x" id="resetModalClose" aria-label="Close">×</button>
+      </header>
+      <p class="modal-sub" id="resetModalDesk">Current desk: —</p>
+      <fieldset class="reset-radios" id="resetModeGroup">
+        <legend class="sr-only">Reset mode</legend>
+        <label class="reset-option">
+          <input type="radio" name="resetMode" value="backtest" />
+          <span class="reset-option-body">
+            <strong>Backtesting</strong>
+            <small>Clear backtest runs &amp; closed BT trades only</small>
+          </span>
+        </label>
+        <label class="reset-option">
+          <input type="radio" name="resetMode" value="paper" checked />
+          <span class="reset-option-body">
+            <strong>Paper trading</strong>
+            <small>Clear paper trades &amp; refund open paper capital</small>
+          </span>
+        </label>
+        <label class="reset-option">
+          <input type="radio" name="resetMode" value="both" />
+          <span class="reset-option-body">
+            <strong>Backtest + Paper</strong>
+            <small>Clear both books on this desk / all desks</small>
+          </span>
+        </label>
+      </fieldset>
+      <div class="modal-note">
+        <span class="metric-tag">Live safe</span>
+        <p>Live market trades are never deleted.</p>
+      </div>
+      <footer class="modal-actions">
+        <button type="button" class="btn ghost" id="resetModalCancel">Cancel</button>
+        <button type="button" class="btn danger-solid" id="resetModalConfirm">Clear selected</button>
+      </footer>
+    </div>
+  </div>
+
+  <main>
+    <section class="hero-metrics" id="capitalStrip">
+      <article class="metric-card">
+        <div class="metric-top">
+          <span class="metric-label">Total capital</span>
+          <span class="metric-tag">Shared</span>
+        </div>
+        <div class="metric-value" id="mCapital">—</div>
+        <p class="metric-note">One pool for Nifty + Stocks</p>
+      </article>
+      <article class="metric-card accent">
+        <div class="metric-top">
+          <span class="metric-label" id="mProfitLabel">Mode profit</span>
+          <span class="metric-tag" id="mProfitTag">Backtest</span>
+        </div>
+        <div class="metric-value" id="mTotalProfit">—</div>
+        <p class="metric-note" id="mProfitSub">Net closed PnL for active tab</p>
+      </article>
+      <article class="metric-card">
+        <div class="metric-top">
+          <span class="metric-label" id="mBalanceLabel">Free cash</span>
+          <span class="metric-tag" id="mBalanceTag">Paper</span>
+        </div>
+        <div class="metric-value" id="mBalance">—</div>
+        <p class="metric-note" id="mBalanceSub">Available for either desk</p>
+      </article>
+    </section>
+
+    <section class="overview-panel on" id="overviewPanel">
+      <div class="desk-cards">
+        <button type="button" class="desk-card" data-open-desk="nifty">
+          <div class="desk-card-top">
+            <strong>Nifty</strong>
+            <span class="metric-tag">Index options</span>
+          </div>
+          <div class="desk-card-grid">
+            <div><span>Paper PnL</span><b id="ovNiftyPaper">—</b></div>
+            <div><span>BT PnL</span><b id="ovNiftyBt">—</b></div>
+            <div><span>Invested</span><b id="ovNiftyInv">—</b></div>
+            <div><span>Open</span><b id="ovNiftyOpen">—</b></div>
+          </div>
+          <p class="metric-note">BOS · CE/PE · shared cash</p>
+        </button>
+        <button type="button" class="desk-card" data-open-desk="stocks">
+          <div class="desk-card-top">
+            <strong>Stocks</strong>
+            <span class="metric-tag">Nifty 100 F&O</span>
+          </div>
+          <div class="desk-card-grid">
+            <div><span>Paper PnL</span><b id="ovStocksPaper">—</b></div>
+            <div><span>BT PnL</span><b id="ovStocksBt">—</b></div>
+            <div><span>Invested</span><b id="ovStocksInv">—</b></div>
+            <div><span>Open</span><b id="ovStocksOpen">—</b></div>
+          </div>
+          <p class="metric-note">Same BOS · stock F&O CE/PE · 5m scan</p>
+        </button>
+      </div>
+      <section class="mode-snap" id="capitalSplit">
+        <div class="snap-item">
+          <span>Free cash</span>
+          <strong id="ovFreeCash">—</strong>
+        </div>
+        <div class="snap-item">
+          <span>In Nifty</span>
+          <strong id="ovCapNifty">—</strong>
+        </div>
+        <div class="snap-item">
+          <span>In Stocks</span>
+          <strong id="ovCapStocks">—</strong>
+        </div>
+        <div class="snap-item">
+          <span>Total capital</span>
+          <strong id="ovCapTotal">—</strong>
+        </div>
+      </section>
+    </section>
+
+    <div id="deskWorkbench" class="desk-workbench" hidden>
+
+    <section class="mode-snap" id="modeSnap">
+      <div class="snap-item">
+        <span>Backtest</span>
+        <strong id="mBtPnl" class="pos">—</strong>
+      </div>
+      <div class="snap-item">
+        <span>Paper</span>
+        <strong id="mPaperPnl">—</strong>
+      </div>
+      <div class="snap-item">
+        <span>Live</span>
+        <strong id="mLivePnl">—</strong>
+      </div>
+      <div class="snap-item">
+        <span>Paper cash</span>
+        <strong id="mCash">—</strong>
+      </div>
+      <div class="snap-item">
+        <span>Live arm</span>
+        <strong id="mLiveArm">OFF</strong>
+      </div>
+    </section>
+
+    <div class="toolbar">
+      <nav class="tabs" id="modeTabs" role="tablist">
+        <button type="button" class="tab on" data-mode="backtest" role="tab">Backtesting</button>
+        <button type="button" class="tab" data-mode="paper" role="tab">Paper</button>
+        <button type="button" class="tab" data-mode="live" role="tab">Live</button>
+        <span class="tab-ink" id="tabInk"></span>
+      </nav>
+      <div class="filters" id="tradeFilters">
+        <div class="seg tiny" data-filter="opt">
+          <button type="button" class="fbtn on" data-opt="all">All</button>
+          <button type="button" class="fbtn" data-opt="CE">CE</button>
+          <button type="button" class="fbtn" data-opt="PE">PE</button>
+        </div>
+        <div class="seg tiny" data-filter="result">
+          <button type="button" class="fbtn on" data-result="all">Any</button>
+          <button type="button" class="fbtn" data-result="win">Wins</button>
+          <button type="button" class="fbtn" data-result="loss">Losses</button>
+        </div>
+        <input id="searchBox" class="search" type="search" placeholder="Search company / CE-PE / strike…" />
+        <span class="filter-meta" id="filterMeta">Session: all</span>
+      </div>
+    </div>
+
+    <section class="panel on" id="panel-backtest" data-mode="backtest">
+      <div class="stats" id="btStats"></div>
+      <div class="charts">
+        <div class="card span2">
+          <div class="card-h"><h3>Equity</h3><span class="hint">session window</span></div>
+          <div class="chart-box tall"><canvas id="btEquityChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Wins</h3></div>
+          <div class="chart-box"><canvas id="btWinChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Exits</h3></div>
+          <div class="chart-box"><canvas id="btExitChart"></canvas></div>
+        </div>
+        <div class="card span2">
+          <div class="card-h"><h3>PnL / trade</h3></div>
+          <div class="chart-box"><canvas id="btPnlChart"></canvas></div>
+        </div>
+      </div>
+      <div class="split">
+        <div class="card">
+          <div class="card-h"><h3>Running</h3><span id="btOpenCount">0</span></div>
+          <div class="table-wrap short">
+            <table>
+              <thead><tr>
+                <th>Date</th><th>Company</th><th>CE/PE</th><th>Strike</th>
+                <th>Entry time</th><th>Prem entry</th><th>Lot ₹</th>
+                <th>Stop</th><th>Target</th>
+                <th>Qty</th><th>Lot</th>
+              </tr></thead>
+              <tbody id="btOpenBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card detail-card">
+          <div class="card-h"><h3>Details</h3></div>
+          <div id="btDetail" class="detail empty">Select a trade</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>Closed trades</h3><span id="btCount">0</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Date</th><th>Company</th><th>CE/PE</th><th>Strike</th>
+              <th>Entry time</th><th>Prem entry</th><th>Prem exit</th><th>Lot ₹</th>
+              <th>Exit time</th><th>Reason</th><th>Qty</th><th>Lot</th>
+              <th>PnL /u</th><th>PnL</th><th>R</th>
+            </tr></thead>
+            <tbody id="btBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>Runs</h3><span class="hint">by run start · same period</span></div>
+        <div class="table-wrap short">
+          <table>
+            <thead><tr><th>When</th><th>Strategy</th><th>Days</th><th>Trades</th><th>Win%</th><th>PnL</th><th>Avg R</th><th>DD</th><th>PF</th></tr></thead>
+            <tbody id="btRuns"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-paper" data-mode="paper">
+      <div class="stats" id="paperStats"></div>
+      <div class="charts">
+        <div class="card span2">
+          <div class="card-h"><h3>Paper equity</h3></div>
+          <div class="chart-box tall"><canvas id="paperEquityChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Wins</h3></div>
+          <div class="chart-box"><canvas id="paperWinChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Exits</h3></div>
+          <div class="chart-box"><canvas id="paperExitChart"></canvas></div>
+        </div>
+      </div>
+      <div class="split">
+        <div class="card">
+          <div class="card-h"><h3>Running trades</h3><span id="paperOpenCount">0</span></div>
+          <div class="table-wrap short">
+            <table>
+              <thead><tr>
+                <th>Status</th><th>Company</th><th>CE/PE</th><th>Strike</th>
+                <th>Entry time</th><th>Prem entry</th><th>Lot ₹</th>
+                <th>Stop</th><th>Target</th>
+                <th>Qty</th><th>Lot</th>
+              </tr></thead>
+              <tbody id="paperOpenBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card detail-card">
+          <div class="card-h"><h3>Details</h3></div>
+          <div id="paperDetail" class="detail empty">Select a trade</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>Closed trades</h3><span id="paperCount">0</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Status</th><th>Company</th><th>CE/PE</th><th>Strike</th>
+              <th>Entry time</th><th>Prem entry</th><th>Prem exit</th><th>Lot ₹</th>
+              <th>Exit time</th><th>Reason</th><th>Qty</th><th>Lot</th>
+              <th>PnL /u</th><th>PnL</th><th>R</th>
+            </tr></thead>
+            <tbody id="paperBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>Log</h3></div>
+        <ul id="paperEvents" class="list mono"><li>None</li></ul>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-live" data-mode="live">
+      <div class="banner" id="liveBanner">Live OFF</div>
+      <div class="stats" id="liveStats"></div>
+      <div class="charts">
+        <div class="card span2">
+          <div class="card-h"><h3>Live equity</h3></div>
+          <div class="chart-box tall"><canvas id="liveEquityChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Wins</h3></div>
+          <div class="chart-box"><canvas id="liveWinChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Exits</h3></div>
+          <div class="chart-box"><canvas id="liveExitChart"></canvas></div>
+        </div>
+      </div>
+      <div class="split">
+        <div class="card">
+          <div class="card-h"><h3>Running trades</h3><span id="liveOpenCount">0</span></div>
+          <div class="table-wrap short">
+            <table>
+              <thead><tr>
+                <th>Status</th><th>Company</th><th>CE/PE</th><th>Strike</th>
+                <th>Entry time</th><th>Prem entry</th><th>Lot ₹</th>
+                <th>Stop</th><th>Target</th>
+                <th>Qty</th><th>Lot</th>
+              </tr></thead>
+              <tbody id="liveOpenBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card detail-card">
+          <div class="card-h"><h3>Details</h3></div>
+          <div id="liveDetail" class="detail empty">No live trades</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>Closed trades</h3><span id="liveCount">0</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Status</th><th>Company</th><th>CE/PE</th><th>Strike</th>
+              <th>Entry time</th><th>Prem entry</th><th>Prem exit</th><th>Lot ₹</th>
+              <th>Exit time</th><th>Reason</th><th>Qty</th><th>Lot</th>
+              <th>PnL /u</th><th>PnL</th><th>R</th>
+            </tr></thead>
+            <tbody id="liveBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card pad"><p id="liveConfigLines" class="muted">—</p></div>
+    </section>
+    </div>
+  </main>
+  <script src="/static/app.js?v=20261111f"></script>
+</body>
+</html>

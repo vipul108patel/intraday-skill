@@ -1,0 +1,1 @@
+"""Indian-market strategy modules adapted from day-trader-skill."""
