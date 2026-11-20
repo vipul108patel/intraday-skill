@@ -14,6 +14,7 @@ from src.db.store import get_store
 from src.market.calendar import IST, is_trading_day, parse_hhmm, previous_trading_days
 from src.market.context import load_symbol_context
 from src.models.trade import BacktestSummary, ExitReason, Mode, TradeStatus
+from src.strategies.option_price import market_option_premium
 from src.strategies.pipeline import evaluate_symbol_day
 from src.strategies.risk import daily_loss_limit_inr
 from src.strategies.trail import simulate_with_trail
@@ -142,19 +143,46 @@ def run_backtest(
                 continue
 
             qty = trade.qty
-            entry_px = float(trade.planned_entry)
+            # Index levels drive WHEN to exit (strategy stops/targets on spot).
+            index_entry = float(trade.planned_entry)
             entry_tm = trade.entry_time
             stop = float(trade.planned_stop)
             target = float(trade.planned_target)
             side = trade.side or "buy"
             slip = float(cfg.get("paper_slippage_bps", 2)) / 10000.0
-            fill_entry = entry_px * (1 + slip) if side == "buy" else entry_px * (1 - slip)
+            index_fill = (
+                index_entry * (1 + slip) if side == "buy" else index_entry * (1 - slip)
+            )
 
-            trade.mark_open(fill_entry, entry_tm, qty)
+            opt = (trade.raw or {}).get("option") or {}
+            options_mode = str(cfg.get("trade_instrument", "")).lower() == "options"
+            use_market_prem = (
+                options_mode
+                and str(cfg.get("option_premium_mode", "market")).lower() != "estimate"
+            )
+
+            entry_prem = trade.option_premium
+            entry_src = (opt.get("premium_source") or "") if opt else ""
+            if use_market_prem:
+                if entry_prem is None:
+                    entry_prem, entry_src = market_option_premium(
+                        opt, as_of=entry_tm, client=client
+                    )
+                if entry_prem is None:
+                    trade.status = TradeStatus.RISK_BLOCKED
+                    if trade.risk_verdict:
+                        trade.risk_verdict.passed = False
+                        trade.risk_verdict.reasons.append(
+                            f"entry premium missing ({entry_src})"
+                        )
+                    store.upsert_trade(trade)
+                    continue
+
+            # Simulate exit timing on index candles
             exit_px, exit_tm, reason, trail_meta = simulate_exit(
                 df,
                 entry_tm,
-                fill_entry,
+                index_fill,
                 stop,
                 target,
                 trade.flat_by or cfg.get("flat_by", "15:15"),
@@ -163,13 +191,53 @@ def run_backtest(
                 cfg=cfg,
                 qty=qty,
             )
-            if side == "buy":
-                fill_exit = exit_px * (1 - slip)
-            else:
-                fill_exit = exit_px * (1 + slip)
 
+            if use_market_prem:
+                exit_prem, exit_src = market_option_premium(
+                    opt, as_of=exit_tm, client=client
+                )
+                if exit_prem is None:
+                    trade.status = TradeStatus.RISK_BLOCKED
+                    if trade.risk_verdict:
+                        trade.risk_verdict.passed = False
+                        trade.risk_verdict.reasons.append(
+                            f"exit premium missing ({exit_src})"
+                        )
+                    store.upsert_trade(trade)
+                    continue
+                # Long CE/PE: buy premium, sell premium (slippage in premium space)
+                fill_entry = float(entry_prem) * (1 + slip)
+                fill_exit = float(exit_prem) * (1 - slip)
+                trade.option_premium = round(fill_entry, 2)
+                trade.invested_amount = round(fill_entry * int(qty), 2)
+                trade.raw["option"] = {
+                    **opt,
+                    "premium": trade.option_premium,
+                    "premium_source": entry_src or opt.get("premium_source"),
+                    "exit_premium": round(fill_exit, 2),
+                    "exit_premium_source": exit_src,
+                    "invested_amount": trade.invested_amount,
+                    "index_entry": index_fill,
+                    "index_exit": exit_px,
+                }
+                # PnL from option premiums; side is always long option
+                trade.side = "buy"
+            else:
+                if side == "buy":
+                    fill_entry = index_fill
+                    fill_exit = exit_px * (1 - slip)
+                else:
+                    fill_entry = index_fill
+                    fill_exit = exit_px * (1 + slip)
+
+            trade.mark_open(fill_entry, entry_tm, qty)
             trade.raw["trail"] = trail_meta
             steps = list(trade.strategy_steps or [])
+            if use_market_prem:
+                steps.append(
+                    f"Fills (NFO market): entry ₹{fill_entry:.2f} ({entry_src}) → "
+                    f"exit ₹{fill_exit:.2f} ({exit_src}) · index {index_fill:.2f}→{exit_px:.2f}"
+                )
             for leg in trail_meta.get("scale_outs") or []:
                 steps.append(
                     f"Lot {leg.get('lot_index')}: booked @ {leg.get('price')} "
@@ -232,6 +300,7 @@ def run_backtest(
                 if str(cfg.get("strategy", "")).lower().startswith("nifty_bos")
                 else "EMA20/VWAP/OR break+retest+confirm. "
             )
+            + "Option fills from Angel NFO hist/live (no premium estimate). "
             + "Risk 5–7% · profit 10–12% · daily loss / trade caps from config."
         ),
     )

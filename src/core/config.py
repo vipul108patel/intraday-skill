@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -128,6 +128,15 @@ def load_desk_config(desk: str | None = "nifty") -> dict[str, Any]:
     cfg["paper_starting_cash"] = start
     cfg["_capital"] = capital
     cfg["_config_path"] = str(path)
+    # Shared live arm flags from capital.json override desk when present
+    if "paper" in capital:
+        cfg["paper"] = bool(capital["paper"])
+    if "live_enabled" in capital:
+        cfg["live_enabled"] = bool(capital["live_enabled"])
+    if "live_assume_cash" in capital:
+        cfg["live_assume_cash"] = capital["live_assume_cash"]
+    if "live_ignore_cash_check" in capital:
+        cfg["live_ignore_cash_check"] = capital["live_ignore_cash_check"]
     return cfg
 
 
@@ -152,8 +161,81 @@ def list_desks() -> list[dict[str, Any]]:
                 "trade_instrument": cfg.get("trade_instrument"),
                 "watchlist_n": len(cfg.get("watchlist") or []),
                 "config_path": str(path),
+                "paper": bool(cfg.get("paper", True)),
+                "live_enabled": bool(cfg.get("live_enabled", False)),
             }
         )
+    return out
+
+
+def live_armed(cfg: Optional[dict] = None) -> bool:
+    """True only when paper is off and live_enabled is on."""
+    capital = load_capital_config()
+    # Shared kill-switch in capital.json wins when present
+    if "live_enabled" in capital or "paper" in capital:
+        paper = bool(capital.get("paper", True))
+        live = bool(capital.get("live_enabled", False))
+        return live and not paper
+    if cfg is not None:
+        return bool(cfg.get("live_enabled", False)) and not bool(cfg.get("paper", True))
+    # Both desks must be armed for global armed=True
+    for key in DESK_CONFIG_PATHS:
+        path = DESK_CONFIG_PATHS[key]
+        if not path.exists():
+            continue
+        dcfg = load_trading_config(path)
+        if not (bool(dcfg.get("live_enabled", False)) and not bool(dcfg.get("paper", True))):
+            return False
+    return True
+
+
+def set_live_arm(armed: bool, desks: Optional[list[str]] = None) -> dict[str, Any]:
+    """
+    Arm/disarm live trading on capital.json + each desk config together.
+    armed=True → paper=false, live_enabled=true
+    armed=False → paper=true, live_enabled=false
+    """
+    keys = desks or list(DESK_CONFIG_PATHS.keys())
+    capital = load_capital_config()
+    capital["paper"] = not armed
+    capital["live_enabled"] = bool(armed)
+    capital["live_note"] = (
+        "LIVE ARMED — real NFO orders enabled"
+        if armed
+        else "Live OFF — paper only. Set live_enabled via API/CLI to arm."
+    )
+    save_capital_config(capital)
+
+    updated = []
+    for key in keys:
+        key = normalize_desk(key)
+        path = DESK_CONFIG_PATHS.get(key)
+        if not path or not path.exists():
+            continue
+        cfg = load_trading_config(path)
+        cfg["paper"] = not armed
+        cfg["live_enabled"] = bool(armed)
+        save_trading_config(cfg, path)
+        updated.append(key)
+
+    return {
+        "armed": bool(armed),
+        "paper": not armed,
+        "live_enabled": bool(armed),
+        "desks": updated,
+        "capital": capital,
+    }
+
+
+def apply_live_flags_to_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Overlay shared capital live flags onto a desk config (capital wins)."""
+    capital = load_capital_config()
+    out = dict(cfg)
+    if "paper" in capital:
+        out["paper"] = bool(capital["paper"])
+    if "live_enabled" in capital:
+        out["live_enabled"] = bool(capital["live_enabled"])
+    out["_capital"] = capital
     return out
 
 

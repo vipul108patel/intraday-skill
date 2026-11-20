@@ -430,29 +430,32 @@ function paintHeroMetrics() {
   if (!lastSummary) return;
   const s = lastSummary;
   const acct = s.account || {};
-  const capital = Number(acct.total_capital ?? s.config?.budget ?? 0);
+  const configCapital = Number(acct.total_capital ?? s.config?.budget ?? 0);
+  const angelCashRaw = acct.angel_available_cash ?? acct.live_cash ?? s.live_status?.available_cash;
+  const angelCash = angelCashRaw != null && angelCashRaw !== "" ? Number(angelCashRaw) : null;
+  const rmsErr = s.live_status?.rms_error || null;
   const mode = activeMode;
   let profit = 0;
-  let balance = capital;
+  let balance = configCapital;
   let tag = "Backtest";
   let profitNote = "Net closed PnL · backtest";
   let balanceNote = "Capital + backtest PnL";
 
   if (mode === "paper") {
     profit = Number(acct.paper_profit ?? s.paper?.pnl ?? 0);
-    balance = Number(acct.paper_cash ?? s.paper_account?.cash ?? capital);
+    balance = Number(acct.paper_cash ?? s.paper_account?.cash ?? configCapital);
     tag = "Paper";
     profitNote = "Net closed PnL · paper";
     balanceNote = "Available paper cash";
   } else if (mode === "live") {
     profit = Number(acct.live_profit ?? s.live?.pnl ?? 0);
-    balance = capital + profit;
+    balance = angelCash != null ? angelCash : configCapital + profit;
     tag = "Live";
     profitNote = "Net closed PnL · live";
-    balanceNote = "Capital + live PnL";
+    balanceNote = angelCash != null ? "Angel RMS available cash" : "RMS unavailable — check Angel login";
   } else {
     profit = Number(acct.backtest_profit ?? s.backtest?.pnl ?? 0);
-    balance = Number(acct.backtest_balance ?? capital + profit);
+    balance = Number(acct.backtest_balance ?? configCapital + profit);
     tag = "Backtest";
   }
 
@@ -467,17 +470,40 @@ function paintHeroMetrics() {
     if (Number.isFinite(Number(value))) el.classList.add(Number(value) >= 0 ? "pos" : "neg");
   };
 
-  setText("mCapital", money(capital));
+  // Always prefer live Angel RMS in the first card when available
+  if (angelCash != null) {
+    setText("mCapital", money(angelCash));
+    setTone("mCapital", angelCash);
+    setText("mCapitalLabel", "Angel balance");
+    setText("mCapitalTag", "RMS");
+    setText("mCapitalSub", `Available cash · config pool ${money(configCapital, 0)}`);
+  } else {
+    setText("mCapital", money(configCapital));
+    setText("mCapitalLabel", "Config capital");
+    setText("mCapitalTag", "Shared");
+    setText(
+      "mCapitalSub",
+      rmsErr ? `Angel RMS error: ${rmsErr}` : "Angel balance unavailable — refresh / check .env",
+    );
+  }
+
   setText("mTotalProfit", money(profit));
   setTone("mTotalProfit", profit);
   setText("mBalance", money(balance));
-  setTone("mBalance", balance - capital);
+  setTone("mBalance", Number(balance) - (angelCash != null ? angelCash : configCapital));
   setText("mProfitLabel", `${tag} profit`);
   setText("mProfitTag", tag);
   setText("mBalanceLabel", `${tag} balance`);
   setText("mBalanceTag", tag);
   setText("mProfitSub", profitNote);
   setText("mBalanceSub", balanceNote);
+
+  const pillCash = document.getElementById("pillCash");
+  if (pillCash) {
+    pillCash.textContent = angelCash != null ? `Cash ${money(angelCash)}` : "Cash —";
+    pillCash.title = rmsErr || "Angel RMS availablecash";
+    pillCash.className = angelCash != null ? "chip green" : "chip";
+  }
 }
 
 function planFromSummary() {
@@ -748,9 +774,13 @@ function renderClosedTable(bodyId, trades, kind, detailId) {
     const premOut = exitPremiumOf(t);
     const pnlU = pnlPerUnit(t);
     const delay = `style="animation-delay:${Math.min(i, 16) * 22}ms"`;
+    const failed = t.status === "cancelled" || (t.status === "risk_blocked" && t.raw?.live?.order_attempted);
+    const statusLabel = failed
+      ? (t.raw?.live?.order_ok === false ? "FAILED" : t.status)
+      : t.status;
     const lead = kind === "bt"
       ? `<td>${t.session_date || "—"}</td>`
-      : `<td>${t.status}</td>`;
+      : `<td class="${failed ? "neg" : ""}">${statusLabel}</td>`;
     return `<tr data-idx="${i}" ${delay}>
       ${lead}
       <td><b title="${t.option_symbol || company}">${company}</b></td>
@@ -783,7 +813,12 @@ function splitTrades(bucket) {
   if (Array.isArray(bucket)) {
     return {
       open: bucket.filter((t) => t.status === "open"),
-      closed: bucket.filter((t) => t.status === "closed"),
+      closed: bucket.filter(
+        (t) =>
+          t.status === "closed" ||
+          t.status === "cancelled" ||
+          (t.status === "risk_blocked" && t.raw?.live?.order_attempted),
+      ),
     };
   }
   return {
@@ -847,7 +882,7 @@ async function refreshHealth() {
   document.getElementById("pillLtp").textContent =
     h.nifty_ltp != null ? `NIFTY ${Number(h.nifty_ltp).toLocaleString("en-IN")}` : "NIFTY —";
   const mode = document.getElementById("pillMode");
-  if (h.live_enabled && !h.paper) {
+  if (h.live_armed || (h.live_enabled && !h.paper)) {
     mode.textContent = "LIVE";
     mode.className = "chip bad";
   } else {
@@ -861,6 +896,18 @@ async function refreshHealth() {
   } else {
     angel.textContent = h.angel?.credentials_present ? "Angel…" : "No .env";
     angel.className = "chip";
+  }
+  const pillCash = document.getElementById("pillCash");
+  if (pillCash) {
+    const cash = h.angel_available_cash ?? h.angel?.rms?.availablecash;
+    if (cash != null && cash !== "") {
+      pillCash.textContent = `Cash ${money(cash)}`;
+      pillCash.className = "chip green";
+    } else if (h.angel?.rms_error) {
+      pillCash.textContent = "Cash err";
+      pillCash.title = h.angel.rms_error;
+      pillCash.className = "chip";
+    }
   }
 }
 
@@ -918,7 +965,23 @@ async function refreshAll() {
     tone("mLivePnl", s.live.pnl);
     const cash = s.paper_account?.cash ?? s.account?.paper_cash;
     document.getElementById("mCash").textContent = money(cash);
-    document.getElementById("mLiveArm").textContent = s.live_status.armed ? "ARMED" : "OFF";
+    const armed = !!(s.live_status?.armed);
+    document.getElementById("mLiveArm").textContent = armed ? "ARMED" : "OFF";
+    const armBtn = document.getElementById("btnLiveArm");
+    if (armBtn) {
+      armBtn.textContent = armed ? "Disarm live" : "Arm live";
+      armBtn.classList.toggle("danger", !armed);
+    }
+    const angelCashTop =
+      s.account?.angel_available_cash ?? s.account?.live_cash ?? s.live_status?.available_cash;
+    const cashElTop = document.getElementById("liveAngelCash");
+    if (cashElTop) cashElTop.textContent = money(angelCashTop);
+    const hintTop = document.getElementById("liveArmHint");
+    if (hintTop) {
+      hintTop.textContent = armed
+        ? " · ARMED — auto NFO orders"
+        : " · paper mode (Arm live to enable real orders)";
+    }
     paintHeroMetrics();
     paintOverview(s);
 
@@ -947,19 +1010,40 @@ async function refreshAll() {
         </tr>`).join("") || `<tr><td colspan="9">No runs — click Backtest</td></tr>`;
 
       const eventDesk = activeDesk === "stocks" ? "stocks" : "nifty";
-      const events = await api(`/api/events?limit=30&desk=${eventDesk}`);
-      document.getElementById("paperEvents").innerHTML = events.length
-        ? events.map((e) => `<li>[${e.ts?.slice(11, 19)}] ${e.message}</li>`).join("")
-        : "<li>None</li>";
+      const renderEventList = (elId, rows) => {
+        const el = document.getElementById(elId);
+        if (!el) return;
+        el.innerHTML = rows.length
+          ? rows.map((e) => `<li>[${e.ts?.slice(11, 19)}] ${e.message}</li>`).join("")
+          : "<li>None</li>";
+      };
+      const [paperEv, liveEv] = await Promise.all([
+        api(`/api/events?limit=40&desk=${eventDesk}&mode=paper`),
+        api(`/api/events?limit=40&desk=${eventDesk}&mode=live`),
+      ]);
+      renderEventList("paperEvents", paperEv);
+      renderEventList("liveEvents", liveEv);
 
       const banner = document.getElementById("liveBanner");
-      banner.textContent = s.live_status.message;
-      banner.className = s.live_status.armed ? "banner on" : "banner";
+      banner.textContent = s.live_status?.message || (armed ? "LIVE ARMED" : "Live OFF");
+      banner.className = armed ? "banner on" : "banner";
+      const angelCash =
+        s.account?.angel_available_cash ?? s.account?.live_cash ?? s.live_status?.available_cash;
+      const cashEl = document.getElementById("liveAngelCash");
+      if (cashEl) cashEl.textContent = money(angelCash);
+      const hint = document.getElementById("liveArmHint");
+      if (hint) {
+        hint.textContent = armed
+          ? " · ARMED — auto NFO orders"
+          : " · paper mode (Arm live to enable real orders)";
+      }
+      const err = s.live_status?.rms_error || s.live_status?.last_error;
       document.getElementById("liveConfigLines").innerHTML =
         `desk=<code>${activeDesk}</code> · strategy=<code>${strategy}</code> · ` +
         `instrument=<code>${s.config.trade_instrument || "—"}</code> · ` +
         `lot=<code>${lot}</code> · watchlist=<code>${s.config.watchlist_n || 0}</code> · ` +
-        `target ${s.config.default_target_r}R · flat ${s.config.flat_by}`;
+        `target ${s.config.default_target_r}R · flat ${s.config.flat_by}` +
+        (err ? ` · <span class="neg">err: ${err}</span>` : "");
       moveTabInk();
     }
 
@@ -1097,6 +1181,53 @@ document.getElementById("btnPaper").addEventListener("click", async () => {
       `[${r.desk || activeDesk}] open ${r.opened?.length || 0} · close ${r.closed?.length || 0} · cash ${money(r.cash)}`,
       "ok",
     );
+    await refreshAll();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+});
+
+document.getElementById("btnLive").addEventListener("click", async () => {
+  const desk = activeDesk === "overview" ? "all" : activeDesk;
+  toast(`Live tick · ${desk}…`);
+  try {
+    const r = await api("/api/live/tick", {
+      method: "POST",
+      body: JSON.stringify({ desk }),
+    });
+    if (r.desks) {
+      const n = r.desks.nifty || {};
+      const s = r.desks.stocks || {};
+      toast(
+        `LIVE nifty +${n.opened?.length || 0}/-${n.closed?.length || 0} · stocks +${s.opened?.length || 0}/-${s.closed?.length || 0}`,
+        "ok",
+      );
+    } else {
+      toast(
+        `[${r.desk || desk}] LIVE open ${r.opened?.length || 0} · close ${r.closed?.length || 0} · cash ${money(r.available_cash)}`,
+        r.note ? "err" : "ok",
+      );
+      if (r.note) toast(r.note, "err");
+    }
+    await refreshAll();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+});
+
+document.getElementById("btnLiveArm").addEventListener("click", async () => {
+  const currentlyArmed = lastSummary?.live_status?.armed;
+  const next = !currentlyArmed;
+  const msg = next
+    ? "ARM LIVE? Real NFO orders will auto-place on signals for Nifty + Stocks."
+    : "Disarm live? Stops new live orders (open positions still need manage).";
+  if (!window.confirm(msg)) return;
+  try {
+    const r = await api("/api/live/arm", {
+      method: "POST",
+      body: JSON.stringify({ armed: next }),
+    });
+    toast(r.armed ? "LIVE ARMED — real orders ON" : "Live disarmed — paper only", r.armed ? "err" : "ok");
     await refreshAll();
   } catch (e) {
     toast(e.message, "err");

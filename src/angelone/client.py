@@ -62,6 +62,22 @@ def _is_rate_limit_error(err: Any) -> bool:
     )
 
 
+def _is_auth_error(err: Any) -> bool:
+    text = str(err or "").lower()
+    return any(
+        s in text
+        for s in (
+            "invalid token",
+            "ag8001",
+            "token expired",
+            "session expired",
+            "unauthorized",
+            "loginagain",
+            "please login",
+        )
+    )
+
+
 class AngelOneClient:
     # Candle API official caps: 3/sec, 180/min. Stay under both with headroom for Nifty+Stocks.
     _CANDLE_MIN_INTERVAL_S = 0.45
@@ -76,6 +92,9 @@ class AngelOneClient:
         self._instruments: Optional[pd.DataFrame] = None
         self._token_cache: dict[str, str] = {}
         self._last_candle_call_at = 0.0
+        self._rms_cache: Optional[dict[str, Any]] = None
+        self._rms_cache_at = 0.0
+        self._RMS_TTL_S = 20.0
 
     def _throttle_candles(self) -> None:
         """Space candle calls so we stay near ≤2.2 req/sec (safe under Angel's 3/sec)."""
@@ -113,7 +132,7 @@ class AngelOneClient:
                 "ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PASSWORD, ANGEL_TOTP_SECRET."
             )
         self._validate_api_key()
-        if self._jwt and not force:
+        if self._jwt and self._smart is not None and not force:
             return {
                 "jwtToken": self._jwt,
                 "feedToken": self._feed,
@@ -142,6 +161,8 @@ class AngelOneClient:
         self._refresh = payload.get("refreshToken")
         self._feed = smart.getfeedToken()
         self._smart = smart
+        self._rms_cache = None
+        self._rms_cache_at = 0.0
         logger.info("Angel One session created for %s", self.settings.angel_client_code)
         return {
             "jwtToken": self._jwt,
@@ -150,11 +171,18 @@ class AngelOneClient:
         }
 
     def _ensure_session(self):
-        if self._smart is None:
-            self.login()
-            return
-        if self._jwt is None:
+        if self._smart is None or self._jwt is None:
             self.login(force=True)
+
+    def _reauth(self) -> None:
+        """Force fresh login after Invalid Token / expired session."""
+        logger.warning("Angel session invalid — forcing re-login")
+        self._jwt = None
+        self._feed = None
+        self._refresh = None
+        self._smart = None
+        self._rms_cache = None
+        self.login(force=True)
 
     # ----------------------------------------------------------- instruments
 
@@ -309,9 +337,16 @@ class AngelOneClient:
                 self._throttle_candles()
                 try:
                     resp = self._smart.getCandleData(params)
-                    # SmartAPI sometimes returns rate-limit as a non-JSON / failed body
+                    # SmartAPI sometimes returns rate-limit / auth as a failed body
                     if isinstance(resp, dict) and not resp.get("status"):
-                        msg = str(resp.get("message") or resp.get("errorcode") or resp)
+                        msg = str(
+                            resp.get("message")
+                            or resp.get("errorcode")
+                            or resp.get("errorCode")
+                            or resp
+                        )
+                        if _is_auth_error(msg):
+                            raise AngelOneError(msg)
                         if _is_rate_limit_error(msg):
                             raise AngelOneError(msg)
                     break
@@ -331,7 +366,7 @@ class AngelOneClient:
                     if attempt == 0:
                         logger.warning("Candle fetch error, re-login: %s", e)
                         try:
-                            self.login(force=True)
+                            self._reauth() if _is_auth_error(e) else self.login(force=True)
                         except Exception as login_err:
                             logger.warning("Re-login failed: %s", login_err)
                         continue
@@ -487,12 +522,34 @@ class AngelOneClient:
             "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
             "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
         }
-        try:
-            resp = self._smart.getCandleData(params)
-        except Exception as e:
-            logger.warning("Option candle fetch error: %s", e)
-            self.login(force=True)
-            resp = self._smart.getCandleData(params)
+        resp = None
+        for attempt in range(2):
+            try:
+                self._throttle_candles()
+                resp = self._smart.getCandleData(params)
+                if isinstance(resp, dict) and not resp.get("status"):
+                    msg = str(
+                        resp.get("message")
+                        or resp.get("errorcode")
+                        or resp.get("errorCode")
+                        or resp
+                    )
+                    if _is_auth_error(msg) and attempt == 0:
+                        self._reauth()
+                        continue
+                    if _is_rate_limit_error(msg) and attempt == 0:
+                        time.sleep(1.5)
+                        continue
+            except Exception as e:
+                logger.warning("Option candle fetch error: %s", e)
+                if attempt == 0:
+                    try:
+                        self._reauth() if _is_auth_error(e) else self.login(force=True)
+                    except Exception:
+                        pass
+                    continue
+                resp = None
+            break
 
         if not resp or not resp.get("status"):
             return pd.DataFrame(
@@ -536,17 +593,260 @@ class AngelOneClient:
         except Exception:
             return {"ltp": self.get_ltp(symbol, exchange), "symbol": symbol}
 
+    # --------------------------------------------------------------- funds
+
+    def get_rms(self, force: bool = False) -> dict[str, Any]:
+        """Angel RMS limits — availablecash, net, utilisedoptionpremium, etc.
+
+        Cached briefly so dashboard nifty+stocks status does not double-hit the API.
+        """
+        now = time.monotonic()
+        if (
+            not force
+            and self._rms_cache is not None
+            and (now - self._rms_cache_at) < self._RMS_TTL_S
+        ):
+            return dict(self._rms_cache)
+
+        self._ensure_session()
+        resp = self._smart.rmsLimit()
+        if isinstance(resp, dict) and (
+            resp.get("status") is False or _is_auth_error(resp)
+        ):
+            if _is_auth_error(resp):
+                self._reauth()
+                resp = self._smart.rmsLimit()
+        if not resp:
+            raise AngelOneError("rmsLimit returned empty response")
+        if isinstance(resp, dict) and resp.get("status") is False:
+            raise AngelOneError(f"rmsLimit failed: {resp}")
+        data = resp.get("data") if isinstance(resp, dict) and "data" in resp else resp
+        if not isinstance(data, dict):
+            raise AngelOneError(f"rmsLimit unexpected payload: {resp}")
+        out = dict(data)
+        for key in (
+            "availablecash",
+            "net",
+            "availablelimitmargin",
+            "availableintradaypayin",
+            "utilisedoptionpremium",
+            "utiliseddebits",
+            "m2munrealized",
+            "m2mrealized",
+            "collateral",
+        ):
+            if key in out and out[key] is not None:
+                try:
+                    out[key] = float(out[key])
+                except (TypeError, ValueError):
+                    pass
+        self._rms_cache = out
+        self._rms_cache_at = time.monotonic()
+        return dict(out)
+
+    def available_cash(self, force: bool = False) -> float:
+        rms = self.get_rms(force=force)
+        for key in ("availablecash", "net"):
+            val = rms.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
     # --------------------------------------------------------------- orders
 
     def place_order(self, order: dict[str, Any], live_enabled: bool = False) -> dict:
-        """Place order only when live_enabled=True. Otherwise refuse."""
+        """Place order only when live_enabled=True. Otherwise refuse.
+
+        SmartAPI placeOrder returns orderid string on success; we normalize to a dict.
+        Prefer placeOrderFullResponse when available for richer payload.
+        """
         if not live_enabled:
             raise AngelOneError(
                 "Live trading is DISABLED. Set live_enabled=true in config/trading.json "
                 "only when you intentionally want real orders."
             )
         self._ensure_session()
-        return self._smart.placeOrder(order)
+        full = getattr(self._smart, "placeOrderFullResponse", None)
+        if callable(full):
+            resp = full(order)
+            if not resp or (isinstance(resp, dict) and not resp.get("status")):
+                raise AngelOneError(f"placeOrder failed: {resp}")
+            return resp if isinstance(resp, dict) else {"data": {"orderid": resp}, "status": True}
+
+        resp = self._smart.placeOrder(order)
+        if resp is None:
+            raise AngelOneError("placeOrder failed: empty response")
+        if isinstance(resp, dict):
+            if resp.get("status") is False:
+                raise AngelOneError(f"placeOrder failed: {resp}")
+            return resp
+        # placeOrder often returns bare orderid string
+        return {"status": True, "data": {"orderid": str(resp)}, "message": "SUCCESS"}
+
+    def modify_order(self, order: dict[str, Any], live_enabled: bool = False) -> dict:
+        if not live_enabled:
+            raise AngelOneError("Live trading is DISABLED — modify_order refused.")
+        self._ensure_session()
+        resp = self._smart.modifyOrder(order)
+        if isinstance(resp, dict) and resp.get("status") is False:
+            raise AngelOneError(f"modifyOrder failed: {resp}")
+        return resp if isinstance(resp, dict) else {"data": resp, "status": True}
+
+    def cancel_order(
+        self,
+        order_id: str,
+        variety: str = "NORMAL",
+        live_enabled: bool = False,
+    ) -> dict:
+        if not live_enabled:
+            raise AngelOneError("Live trading is DISABLED — cancel_order refused.")
+        self._ensure_session()
+        resp = self._smart.cancelOrder(variety, str(order_id))
+        if isinstance(resp, dict) and resp.get("status") is False:
+            raise AngelOneError(f"cancelOrder failed: {resp}")
+        return resp if isinstance(resp, dict) else {"data": resp, "status": True}
+
+    def order_book(self) -> list[dict[str, Any]]:
+        self._ensure_session()
+        resp = self._smart.orderBook()
+        if isinstance(resp, dict):
+            if resp.get("status") is False:
+                raise AngelOneError(f"orderBook failed: {resp}")
+            data = resp.get("data") or []
+            return data if isinstance(data, list) else []
+        return list(resp or [])
+
+    def trade_book(self) -> list[dict[str, Any]]:
+        self._ensure_session()
+        resp = self._smart.tradeBook()
+        if isinstance(resp, dict):
+            if resp.get("status") is False:
+                raise AngelOneError(f"tradeBook failed: {resp}")
+            data = resp.get("data") or []
+            return data if isinstance(data, list) else []
+        return list(resp or [])
+
+    def positions(self) -> dict[str, Any]:
+        self._ensure_session()
+        resp = self._smart.position()
+        if isinstance(resp, dict) and resp.get("status") is False:
+            raise AngelOneError(f"position failed: {resp}")
+        if isinstance(resp, dict):
+            return resp.get("data") or resp
+        return {"raw": resp}
+
+    @staticmethod
+    def _order_id_from_resp(resp: dict[str, Any]) -> Optional[str]:
+        if not isinstance(resp, dict):
+            return str(resp) if resp else None
+        data = resp.get("data")
+        if isinstance(data, dict):
+            for k in ("orderid", "orderId", "order_id"):
+                if data.get(k):
+                    return str(data[k])
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+        for k in ("orderid", "orderId", "order_id"):
+            if resp.get(k):
+                return str(resp[k])
+        return None
+
+    def place_nfo_market(
+        self,
+        *,
+        transaction: str,
+        tradingsymbol: str,
+        token: str,
+        qty: int,
+        product: str = "INTRADAY",
+        live_enabled: bool = False,
+        ordertag: str = "",
+    ) -> dict[str, Any]:
+        """MARKET order on NFO (CE/PE). qty = absolute units (lot_size × lots)."""
+        txn = str(transaction).upper()
+        if txn not in ("BUY", "SELL"):
+            raise AngelOneError(f"Invalid transaction type: {transaction}")
+        q = int(qty)
+        if q <= 0:
+            raise AngelOneError("NFO quantity must be positive")
+        order = {
+            "variety": "NORMAL",
+            "tradingsymbol": str(tradingsymbol),
+            "symboltoken": str(token),
+            "transactiontype": txn,
+            "exchange": "NFO",
+            "ordertype": "MARKET",
+            "producttype": str(product or "INTRADAY"),
+            "duration": "DAY",
+            "price": "0",
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(q),
+        }
+        if ordertag:
+            order["ordertag"] = str(ordertag)[:19]
+        resp = self.place_order(order, live_enabled=live_enabled)
+        order_id = self._order_id_from_resp(resp)
+        return {"order": order, "response": resp, "order_id": order_id}
+
+    def fill_price_for_order(
+        self,
+        order_id: Optional[str],
+        tradingsymbol: str = "",
+        fallback: Optional[float] = None,
+    ) -> Optional[float]:
+        """Best-effort average fill from trade book / order book."""
+        if order_id:
+            try:
+                for row in self.trade_book():
+                    oid = str(
+                        row.get("orderid")
+                        or row.get("orderId")
+                        or row.get("order_id")
+                        or ""
+                    )
+                    if oid != str(order_id):
+                        continue
+                    for key in ("fillprice", "fillPrice", "averageprice", "averagePrice", "price"):
+                        if row.get(key) not in (None, ""):
+                            px = float(row[key])
+                            if px > 0:
+                                return px
+            except Exception as e:
+                logger.debug("trade_book fill lookup failed: %s", e)
+            try:
+                for row in self.order_book():
+                    oid = str(
+                        row.get("orderid")
+                        or row.get("orderId")
+                        or row.get("order_id")
+                        or ""
+                    )
+                    if oid != str(order_id):
+                        continue
+                    for key in ("averageprice", "averagePrice", "price"):
+                        if row.get(key) not in (None, ""):
+                            px = float(row[key])
+                            if px > 0:
+                                return px
+            except Exception as e:
+                logger.debug("order_book fill lookup failed: %s", e)
+        if tradingsymbol:
+            try:
+                for row in self.trade_book():
+                    if str(row.get("tradingsymbol") or "") != tradingsymbol:
+                        continue
+                    for key in ("fillprice", "fillPrice", "averageprice", "averagePrice", "price"):
+                        if row.get(key) not in (None, ""):
+                            px = float(row[key])
+                            if px > 0:
+                                return px
+            except Exception:
+                pass
+        return float(fallback) if fallback and fallback > 0 else None
 
     def health(self) -> dict[str, Any]:
         ok_creds = self.configured()
@@ -560,6 +860,15 @@ class AngelOneClient:
                 self.login()
                 info["logged_in"] = True
                 info["profile"] = self._smart.getProfile(self._refresh)
+                try:
+                    rms = self.get_rms()
+                    info["rms"] = {
+                        "availablecash": rms.get("availablecash"),
+                        "net": rms.get("net"),
+                        "utilisedoptionpremium": rms.get("utilisedoptionpremium"),
+                    }
+                except Exception as e:
+                    info["rms_error"] = str(e)
             except Exception as e:
                 info["error"] = str(e)
         return info

@@ -18,6 +18,7 @@ from src.angelone.client import get_client
 from src.backtest.engine import run_backtest
 from src.core.config import (
     list_desks,
+    live_armed,
     load_capital_config,
     load_desk_config,
     load_trading_config,
@@ -25,10 +26,11 @@ from src.core.config import (
     save_capital_config,
     save_desk_config,
     save_trading_config,
+    set_live_arm,
 )
 from src.core.paths import ensure_dirs
 from src.db.store import get_store
-from src.live.engine import LiveEngine
+from src.live.engine import LiveEngine, tick_all_desks
 from src.market.calendar import IST, now_ist
 from src.models.trade import Mode, TradeRecord
 
@@ -53,6 +55,14 @@ class ConfigPatch(BaseModel):
 
 class PaperTickRequest(BaseModel):
     desk: str = "nifty"
+
+
+class LiveTickRequest(BaseModel):
+    desk: str = "all"  # nifty | stocks | all
+
+
+class LiveArmRequest(BaseModel):
+    armed: bool = False
 
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
@@ -239,14 +249,19 @@ def health():
     except Exception as e:
         angel["ltp_error"] = str(e)
     paper = PaperEngine(desk="nifty").snapshot()
+    angel_cash = None
+    if isinstance(angel.get("rms"), dict):
+        angel_cash = angel["rms"].get("availablecash")
     return {
         "ok": True,
         "time_ist": now_ist().isoformat(),
         "underlying": cfg.get("underlying", "NIFTY"),
         "paper": cfg.get("paper", True),
         "live_enabled": cfg.get("live_enabled", False),
+        "live_armed": live_armed(cfg),
         "budget": capital.get("total_capital") or cfg.get("budget"),
         "paper_cash": paper.get("cash"),
+        "angel_available_cash": angel_cash,
         "nifty_ltp": nifty_ltp,
         "angel": angel,
         "desks": list_desks(),
@@ -358,18 +373,46 @@ def setups(limit: int = 50):
 
 
 @app.get("/api/events")
-def events(limit: int = 100, kind: Optional[str] = None, desk: str = Query("all")):
-    rows = get_store().list_events(limit=limit)
+def events(
+    limit: int = 100,
+    kind: Optional[str] = None,
+    desk: str = Query("all"),
+    mode: str = Query("all"),  # paper | live | all
+):
+    rows = get_store().list_events(limit=max(limit * 3, 100))
     d = str(desk or "all").lower()
+    m = str(mode or "all").lower()
+
+    def _is_stocks(r: dict) -> bool:
+        k = str(r.get("kind") or "")
+        msg = str(r.get("message") or "")
+        return k in ("paper_stocks", "stocks", "live_stocks") or "[stocks]" in msg
+
+    def _is_live(r: dict) -> bool:
+        k = str(r.get("kind") or "")
+        msg = str(r.get("message") or "")
+        return k in ("live", "live_stocks") or k.startswith("live") or "LIVE " in msg or "] LIVE" in msg
+
+    def _is_paper(r: dict) -> bool:
+        k = str(r.get("kind") or "")
+        msg = str(r.get("message") or "")
+        if _is_live(r):
+            return False
+        return k in ("paper", "paper_stocks") or k.startswith("paper") or "PAPER " in msg or "] PAPER" in msg
+
     if d == "stocks":
-        rows = [r for r in rows if r.get("kind") in ("paper_stocks", "stocks")]
+        rows = [r for r in rows if _is_stocks(r)]
     elif d == "nifty":
-        rows = [r for r in rows if r.get("kind") in ("paper", "nifty") or (
-            r.get("kind") == "paper" and "[stocks]" not in str(r.get("message") or "")
-        )]
+        rows = [r for r in rows if not _is_stocks(r)]
+
+    if m == "live":
+        rows = [r for r in rows if _is_live(r)]
+    elif m == "paper":
+        rows = [r for r in rows if _is_paper(r)]
+
     if kind:
         rows = [r for r in rows if r.get("kind") == kind]
-    return rows
+    return rows[:limit]
 
 
 @app.get("/api/backtests")
@@ -391,7 +434,15 @@ def backtest_run(body: BacktestRequest):
         if not symbols:
             symbols = ["NIFTY"] if desk == "nifty" else []
     try:
-        summary = run_backtest(symbols=symbols, days=body.days, cfg=cfg)
+        # Fresh Angel session — long-running dashboard JWT goes stale
+        client = get_client()
+        try:
+            client.login(force=True)
+        except Exception as login_err:
+            raise HTTPException(400, f"Angel login failed (needed for candles): {login_err}") from login_err
+        summary = run_backtest(symbols=symbols, days=body.days, cfg=cfg, client=client)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, str(e)) from e
     return summary.model_dump(mode="json")
@@ -412,13 +463,46 @@ def paper_tick(body: PaperTickRequest = PaperTickRequest(), desk: str = Query("n
 
 
 @app.get("/api/live/status")
-def live_status():
-    return LiveEngine().status()
+def live_status(desk: str = Query("all")):
+    d = str(desk or "all").lower()
+    if d in ("all", "overview", "both"):
+        nifty = LiveEngine(desk="nifty").status()
+        stocks = LiveEngine(desk="stocks").status()
+        cash = nifty.get("available_cash")
+        if cash is None:
+            cash = stocks.get("available_cash")
+        return {
+            "armed": live_armed(),
+            "available_cash": cash,
+            "nifty": nifty,
+            "stocks": stocks,
+            "message": (
+                "LIVE ARMED — auto NFO orders ON (both desks)"
+                if live_armed()
+                else "Live OFF — paper only. Arm via Live panel or run_live.py --arm"
+            ),
+        }
+    return LiveEngine(desk=normalize_desk(d)).status()
 
 
 @app.post("/api/live/tick")
-def live_tick():
-    return LiveEngine().tick()
+def live_tick(body: LiveTickRequest = LiveTickRequest()):
+    d = str(body.desk or "all").lower()
+    try:
+        if d in ("all", "overview", "both"):
+            return tick_all_desks()
+        return LiveEngine(desk=normalize_desk(d)).tick()
+    except Exception as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/api/live/arm")
+def live_arm(body: LiveArmRequest):
+    """Kill switch: armed=true → paper=false + live_enabled=true on capital + desks."""
+    try:
+        return set_live_arm(bool(body.armed))
+    except Exception as e:
+        raise HTTPException(400, str(e)) from e
 
 
 def _config_public(cfg: dict) -> Dict[str, Any]:
@@ -536,10 +620,91 @@ def _desk_bundle(store, period: str, desk: str) -> Dict[str, Any]:
             },
             "live": {
                 "open": [t.model_dump(mode="json") for t in live_rows if t.status.value == "open"][:50],
-                "closed": [t.model_dump(mode="json") for t in live_rows if t.status.value == "closed"][:100],
+                "closed": [
+                    t.model_dump(mode="json")
+                    for t in live_rows
+                    if t.status.value in ("closed", "cancelled")
+                    or (
+                        t.status.value == "risk_blocked"
+                        and isinstance(t.raw, dict)
+                        and (t.raw.get("live") or {}).get("order_attempted")
+                    )
+                ][:100],
                 "all": [t.model_dump(mode="json") for t in live_rows[:100]],
             },
         },
+    }
+
+
+def _fetch_angel_rms() -> dict:
+    """Single RMS fetch for dashboard (client caches ~20s)."""
+    out: dict[str, Any] = {
+        "available_cash": None,
+        "rms": {},
+        "rms_error": None,
+    }
+    try:
+        client = get_client()
+        if not client.configured():
+            out["rms_error"] = "Angel credentials missing in .env"
+            return out
+        rms = client.get_rms()
+        out["rms"] = {
+            "availablecash": rms.get("availablecash"),
+            "net": rms.get("net"),
+            "collateral": rms.get("collateral"),
+            "availablelimitmargin": rms.get("availablelimitmargin"),
+            "utilisedoptionpremium": rms.get("utilisedoptionpremium"),
+            "m2munrealized": rms.get("m2munrealized"),
+        }
+        cash = rms.get("availablecash")
+        if cash is None:
+            cash = rms.get("net")
+        out["available_cash"] = float(cash) if cash is not None else None
+    except Exception as e:
+        out["rms_error"] = str(e)
+    return out
+
+
+def _angel_live_status(desk: str = "all") -> dict:
+    d = str(desk or "all").lower()
+    rms_info = _fetch_angel_rms()
+    cash = rms_info.get("available_cash")
+
+    def _desk_status(name: str) -> dict:
+        st = LiveEngine(desk=name).status()
+        # Prefer shared RMS so we don't fail the 2nd desk on rate-limit
+        if cash is not None:
+            st["available_cash"] = cash
+            st["rms"] = rms_info.get("rms") or st.get("rms")
+            st["rms_error"] = None
+        elif rms_info.get("rms_error") and not st.get("available_cash"):
+            st["rms_error"] = rms_info.get("rms_error")
+        return st
+
+    if d in ("nifty", "stocks"):
+        st = _desk_status(d)
+        st["rms"] = rms_info.get("rms") or st.get("rms")
+        if cash is not None:
+            st["available_cash"] = cash
+        return st
+
+    nifty = _desk_status("nifty")
+    stocks = _desk_status("stocks")
+    return {
+        "armed": live_armed(),
+        "available_cash": cash,
+        "live_enabled": nifty.get("live_enabled"),
+        "paper_flag": nifty.get("paper_flag"),
+        "nifty": nifty,
+        "stocks": stocks,
+        "rms": rms_info.get("rms") or {},
+        "rms_error": rms_info.get("rms_error"),
+        "message": (
+            "LIVE ARMED — auto NFO orders ON"
+            if live_armed()
+            else "Live OFF — paper only. Arm via Live panel or run_live.py --arm"
+        ),
     }
 
 
@@ -549,7 +714,8 @@ def summary(period: str = Query("all"), desk: str = Query("overview")):
     capital_cfg = load_capital_config()
     capital = float(capital_cfg.get("total_capital") or capital_cfg.get("paper_starting_cash") or 150000)
     start = period_start_ist(period)
-    live = LiveEngine().status()
+    desk_key = str(desk or "overview").lower()
+    live = _angel_live_status("all" if desk_key == "overview" else desk_key)
     recent = filter_backtests(store.list_backtests(25), period)[:10]
 
     nifty = _desk_bundle(store, period, "nifty")
@@ -558,6 +724,8 @@ def summary(period: str = Query("all"), desk: str = Query("overview")):
     nifty_inv = float(nifty.get("invested_open") or 0)
     stocks_inv = float(stocks.get("invested_open") or 0)
     free_cash = round(paper_cash, 2)
+    angel_cash = live.get("available_cash")
+    live_balance = float(angel_cash) if angel_cash is not None else None
 
     desk_key = str(desk or "overview").lower()
     if desk_key in ("nifty", "stocks"):
@@ -582,6 +750,8 @@ def summary(period: str = Query("all"), desk: str = Query("overview")):
                 "total_balance": free_cash,
                 "paper_cash": free_cash,
                 "free_cash": free_cash,
+                "angel_available_cash": live_balance,
+                "live_cash": live_balance,
                 "nifty_invested": nifty_inv,
                 "stocks_invested": stocks_inv,
                 "backtest_balance": round(capital + float(active["backtest"]["pnl"]), 2),
@@ -624,6 +794,8 @@ def summary(period: str = Query("all"), desk: str = Query("overview")):
             "total_balance": free_cash,
             "paper_cash": free_cash,
             "free_cash": free_cash,
+            "angel_available_cash": live_balance,
+            "live_cash": live_balance,
             "nifty_invested": nifty_inv,
             "stocks_invested": stocks_inv,
             "backtest_balance": round(capital + bt_profit, 2),

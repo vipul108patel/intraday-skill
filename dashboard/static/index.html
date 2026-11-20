@@ -19,7 +19,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
-  <link rel="stylesheet" href="/static/styles.css?v=20261111f" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261119live" />
 </head>
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
@@ -41,6 +41,7 @@
       <span id="pillLtp" class="chip green">NIFTY —</span>
       <span id="pillMode" class="chip amber">PAPER</span>
       <span id="pillAngel" class="chip">Angel —</span>
+      <span id="pillCash" class="chip green" title="Angel RMS available cash">Cash —</span>
       <span id="pillLot" class="chip">Lot 65</span>
       <span id="pillStrategy" class="chip teal">—</span>
     </div>
@@ -64,6 +65,8 @@
         <span class="btn-spin" hidden></span>
       </button>
       <button type="button" id="btnPaper" class="btn">Paper tick</button>
+      <button type="button" id="btnLive" class="btn">Live tick</button>
+      <button type="button" id="btnLiveArm" class="btn ghost danger" title="Arm/disarm real Angel orders">Arm live</button>
       <button type="button" id="btnRefresh" class="btn ghost" aria-label="Refresh">↻</button>
       <button type="button" id="btnReset" class="btn ghost danger">Reset</button>
     </div>
@@ -120,11 +123,11 @@
     <section class="hero-metrics" id="capitalStrip">
       <article class="metric-card">
         <div class="metric-top">
-          <span class="metric-label">Total capital</span>
-          <span class="metric-tag">Shared</span>
+          <span class="metric-label" id="mCapitalLabel">Angel balance</span>
+          <span class="metric-tag" id="mCapitalTag">RMS</span>
         </div>
         <div class="metric-value" id="mCapital">—</div>
-        <p class="metric-note">One pool for Nifty + Stocks</p>
+        <p class="metric-note" id="mCapitalSub">Live available cash from Angel One</p>
       </article>
       <article class="metric-card accent">
         <div class="metric-top">
@@ -357,13 +360,20 @@
         </div>
       </div>
       <div class="card">
-        <div class="card-h"><h3>Log</h3></div>
+        <div class="card-h"><h3>Paper log</h3><span class="hint">simulated only</span></div>
         <ul id="paperEvents" class="list mono"><li>None</li></ul>
       </div>
     </section>
 
     <section class="panel" id="panel-live" data-mode="live">
       <div class="banner" id="liveBanner">Live OFF</div>
+      <div class="card pad live-cash-row" style="margin-bottom:0.75rem">
+        <p class="muted" style="margin:0">
+          Angel available cash:
+          <strong id="liveAngelCash">—</strong>
+          <span id="liveArmHint" class="hint"> · paper mode</span>
+        </p>
+      </div>
       <div class="stats" id="liveStats"></div>
       <div class="charts">
         <div class="card span2">
@@ -414,9 +424,13 @@
         </div>
       </div>
       <div class="card pad"><p id="liveConfigLines" class="muted">—</p></div>
+      <div class="card">
+        <div class="card-h"><h3>Live log</h3><span class="hint">Angel real orders only</span></div>
+        <ul id="liveEvents" class="list mono"><li>None</li></ul>
+      </div>
     </section>
     </div>
   </main>
-  <script src="/static/app.js?v=20261111f"></script>
+  <script src="/static/app.js?v=20261119live"></script>
 </body>
 </html>

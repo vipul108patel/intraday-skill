@@ -220,16 +220,30 @@ def build_trade_from_trigger(
 
     status = TradeStatus.TRIGGERED if verdict.passed else TradeStatus.RISK_BLOCKED
 
-    if mode == Mode.BACKTEST or str(cfg.get("option_premium_mode", "")).lower() == "estimate":
-        from src.strategies.option_price import estimate_atm_premium
+    premium, premium_src = resolve_option_premium(
+        option, cfg, as_of=plan.entry_time or now_ist()
+    )
+    if premium is None:
+        from src.models.trade import RiskVerdict
 
-        premium = estimate_atm_premium(float(option.get("spot_ref") or plan.entry), cfg)
-        premium_src = "estimate"
-    else:
-        premium, premium_src = resolve_option_premium(
-            option, cfg, as_of=plan.entry_time or now_ist()
+        reasons = list(verdict.reasons or [])
+        reasons.append(
+            f"real NFO premium unavailable for {option.get('tradingsymbol')} "
+            f"({premium_src}) — no estimate used"
         )
-    invested = invested_from_premium(premium, int(verdict.qty or 0))
+        verdict = RiskVerdict(
+            passed=False,
+            reasons=reasons,
+            warnings=list(verdict.warnings or []),
+            max_loss=0.0,
+            reward_risk=plan.reward_risk,
+            qty=0,
+            notional=0.0,
+        )
+        status = TradeStatus.RISK_BLOCKED
+        invested = 0.0
+    else:
+        invested = invested_from_premium(premium, int(verdict.qty or 0))
     option = {
         **option,
         "premium": premium,
@@ -241,10 +255,13 @@ def build_trade_from_trigger(
         f"({option['moneyness']}) · expiry {option['expiry']} · {option['tradingsymbol']} "
         f"· lot {lot}"
     )
-    steps.append(
-        f"Lot cost: premium ₹{premium:.2f} × qty {verdict.qty} = invested ₹{invested:.2f} "
-        f"({premium_src})"
-    )
+    if premium is not None:
+        steps.append(
+            f"Lot cost: premium ₹{premium:.2f} × qty {verdict.qty} = invested ₹{invested:.2f} "
+            f"({premium_src})"
+        )
+    else:
+        steps.append(f"Premium blocked: market data missing ({premium_src})")
 
     trade = TradeRecord(
         mode=mode,
@@ -343,6 +360,7 @@ def scan_and_build(
     daily_risk_used: float = 0.0,
     consecutive_losses: int = 0,
     realized_day_pnl: float = 0.0,
+    cash: Optional[float] = None,
 ) -> list[TradeRecord]:
     cfg = cfg or load_trading_config()
     hits = _scan_universe(
@@ -373,6 +391,7 @@ def scan_and_build(
             cfg,
             mode=mode,
             bars=candle_map.get(symbol),
+            cash=cash,
             trades_today=passed_today,
             daily_risk_used=daily_risk,
             consecutive_losses=consecutive_losses,

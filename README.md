@@ -72,18 +72,22 @@ python scripts/run_paper.py          # one scan + manage
 python scripts/run_paper.py --loop --every 60
 ```
 
-Dashboard pe **Run paper tick** / **Run backtest** bhi same kaam karte hain.
+Dashboard pe **Paper tick** / **Backtest** bhi same kaam karte hain.
 
-## Live trading (abhi band rakho)
+## Live trading (Angel NFO auto)
 
-`config/trading.json` me:
+Shared kill-switch: [`config/capital.json`](config/capital.json) `paper` + `live_enabled` (overrides both desks).
 
-```json
-"paper": true,
-"live_enabled": false
+```bash
+python scripts/run_live.py --status          # Angel RMS / arm state
+python scripts/run_live.py --arm             # paper=false, live_enabled=true
+python scripts/run_live.py --desk all --loop --every 60
+python scripts/run_live.py --disarm          # kill switch
 ```
 
-Real orders tabhi possible jab **dono**: `"paper": false` **aur** `"live_enabled": true`. Uske baad bhi live engine auto-fire nahi karta — explicit `place_bracket` chahiye.
+Dashboard: **Arm live** → **Live tick**. Signal pe auto NFO BUY; SL/target/trail pe auto SELL. Balance = Angel `availablecash`.
+
+Default abhi **disarmed** (`paper: true`). Real money — pehle chhote `max_lots` / risk caps se test karo.
 
 ## Entry kaise milta hai (NIFTY Signal v1)
 

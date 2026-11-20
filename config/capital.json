@@ -3,5 +3,10 @@
   "paper_starting_cash": 150000,
   "currency": "INR",
   "shared": true,
-  "note": "Single paper cash pool shared by Nifty + Stocks desks. Open positions in either desk reduce free cash for both."
+  "paper": false,
+  "live_enabled": true,
+  "live_assume_cash": 50000,
+  "live_ignore_cash_check": true,
+  "live_note": "LIVE ARMED — cash gate bypassed (assume ₹50k for sizing). Real RMS still shown.",
+  "note": "Single paper cash pool shared by Nifty + Stocks desks. live_enabled/paper here override both desk configs when set."
 }
